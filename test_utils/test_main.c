@@ -101,6 +101,10 @@ extern char **environ;
 #  include <pwd.h>
 #  define RUN_TEST_UNPRIV 1
 # endif
+# if HAVE_DUP
+#  include <unistd.h>
+#  define CHECK_FD_LEAK 1
+# endif
 #endif
 
 #ifndef nitems
@@ -3588,6 +3592,11 @@ test_run(int i, const char *tmpdir)
 	int skips_before = skips;
 	int tmp;
 	mode_t oldumask;
+#ifdef CHECK_FD_LEAK
+	enum { NBUFFD = 20, NCHECKFD = 100 };
+	static int fd[NBUFFD], lastfd = -1;
+	int nextfd;
+#endif
 
 	switch (verbosity) {
 	case VERBOSITY_SUMMARY_ONLY: /* No per-test reports at all */
@@ -3662,10 +3671,69 @@ test_run(int i, const char *tmpdir)
 		(void)seteuid(tuid);
 	}
 #endif
+#ifdef CHECK_FD_LEAK
+	if (lastfd < 0) {
+		/*
+		 * Allocate a number of file descriptors in case the test
+		 * runner has created gaps in the file descriptor table.
+		 * There is no other portable way to check.
+		 */
+		for (int j = 0; j < NBUFFD; j++) {
+			if ((lastfd = fd[j] = dup(0)) < 0) {
+				fprintf(stderr,
+				    "ERROR: Can't create buffer fd %d: %d\n", j, errno);
+				exit(1);
+			}
+		}
+	} else {
+		/*
+		 * Verify that no new gaps have been created in the fd
+		 * table by the test runner.
+		 */
+		if ((nextfd = dup(0)) < 0 || nextfd != lastfd + 1) {
+			fprintf(stderr,
+			    "ERROR: FD table integrity check failed\n");
+			exit(1);
+		}
+		close(nextfd);
+	}
+#endif
 	/*
 	 * Run the actual test.
 	 */
 	(*tests[i].func)();
+#ifdef CHECK_FD_LEAK
+	/*
+	 * There is no portable way to check for file descriptor leaks.
+	 * Most Unices have getdtablesize() but with different semantics.
+	 * Most Unices also have closefrom() and / or close_range() but
+	 * these do not return any indication of how many descriptors were
+	 * closed.  The most reliable method is to allocate a bunch of
+	 * file descriptors and verify that they are consecutive.
+	 * Obviously, this will fail if the test leaks but leaves a large
+	 * enough gap in the table, but we can live with an imperfect test
+	 * as long as it does not generate false positives.
+	 */
+	for (int j = 1; j <= NCHECKFD; j++) {
+		if ((nextfd = dup(0)) < 0 || nextfd < lastfd) {
+			fprintf(stderr,
+			    "ERROR: FD table integrity check failed\n");
+			exit(1);
+		}
+	}
+	assertions++;
+	if (nextfd != lastfd + NCHECKFD) {
+		fprintf(logfile, "Test leaked at least %d file descriptors.\n",
+		    nextfd - (lastfd + NCHECKFD));
+		failures++;
+	}
+	/*
+	 * Finally, close the descriptors we created while checking, as
+	 * well as any that were leaked by the test.
+	 */
+	for (int fd = lastfd + 1; fd <= nextfd; fd++)
+		(void)close(fd);
+#endif
 #ifdef RUN_TEST_UNPRIV
 	/*
 	 * Restore original credentials.
